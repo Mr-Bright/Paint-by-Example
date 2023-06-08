@@ -48,14 +48,27 @@ def get_tensor(normalize=True, toTensor=True):
                                                 (0.5, 0.5, 0.5))]
     return torchvision.transforms.Compose(transform_list)
 
+# 两个的初始化不一样
 def get_tensor_clip(normalize=True, toTensor=True):
     transform_list = []
     if toTensor:
         transform_list += [torchvision.transforms.ToTensor()]
+        transform_list += [torchvision.transforms.Resize((224,224))]
 
     if normalize:
         transform_list += [torchvision.transforms.Normalize((0.48145466, 0.4578275, 0.40821073),
                                                 (0.26862954, 0.26130258, 0.27577711))]
+    return torchvision.transforms.Compose(transform_list)
+
+def get_tensor_encoder(normalize=True, toTensor=True):
+    transform_list = []
+    if toTensor:
+        transform_list += [torchvision.transforms.ToTensor()]
+        transform_list += [torchvision.transforms.Resize((512,512))]
+
+    if normalize:
+        transform_list += [torchvision.transforms.Normalize((0.5, 0.5, 0.5),
+                                                (0.5, 0.5, 0.5))]
     return torchvision.transforms.Compose(transform_list)
 
 
@@ -111,12 +124,13 @@ class OpenImageDataset(data.Dataset):
 
     
     def __getitem__(self, index):
+        # 加载原图
         bbox_path=self.bbox_path_list[index]
         file_name=os.path.splitext(os.path.basename(bbox_path))[0]+'.jpg'
         dir_name=bbox_path.split('/')[-2]
         img_path=os.path.join('dataset/open-images/images',dir_name,file_name)
 
-
+        # 取出bbox的过程，可以不要
         bbox_list=[]
         with open(bbox_path) as f:
             line=f.readline()
@@ -128,10 +142,11 @@ class OpenImageDataset(data.Dataset):
                 bbox_list.append(bbox_temp)
                 line=f.readline()
         bbox=random.choice(bbox_list)
+
         img_p = Image.open(img_path).convert("RGB")
 
    
-        ### Get reference image
+        ### Get reference image 也可以不要
         bbox_pad=copy.copy(bbox)
         bbox_pad[0]=bbox[0]-min(10,bbox[0]-0)
         bbox_pad[1]=bbox[1]-min(10,bbox[1]-0)
@@ -146,7 +161,7 @@ class OpenImageDataset(data.Dataset):
 
 
 
-        ### Generate mask
+        ### Generate mask 一整块都可以不要
         image_tensor = get_tensor()(img_p)
         W,H = img_p.size
 
@@ -245,8 +260,11 @@ class OpenImageDataset(data.Dataset):
             image_tensor_cropped=image_tensor
             mask_tensor_cropped=mask_tensor
 
+
+        ### Resize image这个地方需要改 或者删掉就用原图大小
         image_tensor_resize=T.Resize([self.args['image_size'],self.args['image_size']])(image_tensor_cropped)
         mask_tensor_resize=T.Resize([self.args['image_size'],self.args['image_size']])(mask_tensor_cropped)
+        # mask中1为背景，0为前景
         inpaint_tensor_resize=image_tensor_resize*mask_tensor_resize
 
         return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_tensor_resize,"ref_imgs":ref_image_tensor}
@@ -255,6 +273,158 @@ class OpenImageDataset(data.Dataset):
 
     def __len__(self):
         return self.length
+    
+
+class DressCodeArugmentDataset(data.Dataset):
+    
+    def __init__(self):
+        super(DressCodeArugmentDataset, self).__init__()
+        
+        self.original_img_dir = '/home/kwang/DD_project/SCHP/input/'
+        self.body_parser_dir = '/home/kwang/DD_project/SCHP/label_output/mask/'
+        self.densepose_dir = '/home/kwang/DD_project/DressCode/upper_body/dense/'
+        self.data_txt_path = '/home/kwang/DD_project/ControlNet-main/train_clothes_prompt.txt'
+        self.cut_warped_cloth_dir = '/home/kwang/DD_project/C-VTON/arugment_output/cut_clothes/'
+        self.warped_cloth_dir = '/home/kwang/DD_project/C-VTON/arugment_output/warped_clothes/'
+
+        self.arugment_param = 10
+        self.arugment_ratio = 0.5
+
+
+        self.data = []
+        with open(self.data_txt_path, 'rt') as f:
+            for line in f:
+                self.data.append(line.split('\t')[0])
+
+        self.data = self.data[:-10]
+        
+    def name(self):
+        return "DressCodeArugmentDataset"
+    
+    def __getitem__(self, index):
+        img_name = self.data[index]
+
+        img_p = Image.open(self.original_img_dir + img_name).convert("RGB")
+
+        image_tensor = get_tensor(normalize=True, toTensor=True)(img_p)
+
+
+        # 处理去除原有衣服的图片
+        body_parser = cv2.imread(self.body_parser_dir + img_name[:-4] + '.png',0)
+        densepose = cv2.imread(self.densepose_dir + img_name[:-6] + '_5.png', 0)
+        # todo 可以再调整 1,2是躯干
+        person_cloth_body = ((body_parser==4) | (np.isin(densepose, [15,17,16,18,19,21,20,22]))).astype(np.uint8)
+
+        reference_area = (body_parser==4) | (np.isin(densepose, [1,2,15,17,16,18,19,21,20,22]))
+
+        # 用高斯噪声填充原有衣服和人体部分
+        img_array = np.array(img_p)/127.5 - 1
+        person_cloth_body = person_cloth_body[:,:,np.newaxis]
+        person_cloth_body = np.concatenate([person_cloth_body, person_cloth_body, person_cloth_body], axis=2)
+        random_noise = np.random.normal(0, 1, img_array.shape)
+        inpaint_img = img_array * (1 - person_cloth_body) + random_noise * person_cloth_body
+        inpaint_img = get_tensor()(Image.fromarray(((inpaint_img + 1) * 127.5).astype(np.uint8)))
+
+        # 指示合成区域
+        reference_area = 1-get_tensor(normalize=False, toTensor=True)(Image.fromarray(reference_area.astype(np.uint8)*255))
+
+        # 处理clip的指定衣服图片
+        prob=random.uniform(0, 1)
+        if prob<self.arugment_ratio:
+            arg_img_name = img_name[:-4] + '_arg_' + str(random.randint(0,self.arugment_param-1)) + '.jpg'
+            clip_img = Image.open(self.cut_warped_cloth_dir + arg_img_name).convert("RGB")
+            clip_img = get_tensor_encoder()(clip_img)
+            warp_cloth = Image.open(self.warped_cloth_dir + arg_img_name).convert("RGB")
+            warp_cloth = get_tensor()(warp_cloth)
+        else:
+            clip_img = Image.open(self.cut_warped_cloth_dir + img_name).convert("RGB")
+            clip_img = get_tensor_encoder()(clip_img)
+            warp_cloth = Image.open(self.warped_cloth_dir + img_name).convert("RGB")
+            warp_cloth = get_tensor()(warp_cloth)
+
+        item = {
+            "GT":image_tensor,
+            "inpaint_image":inpaint_img,
+            "inpaint_mask":reference_area,
+            "ref_imgs":clip_img,
+            "warp_cloth": warp_cloth
+            }
+        return item
+    
+    def __len__(self):
+        return len(self.data)
+    
+class DressCodeArugmentDataset_val(data.Dataset):
+    
+    def __init__(self):
+        super(DressCodeArugmentDataset_val, self).__init__()
+        
+        self.original_img_dir = '/home/kwang/DD_project/SCHP/input/'
+        self.body_parser_dir = '/home/kwang/DD_project/SCHP/label_output/mask/'
+        self.densepose_dir = '/home/kwang/DD_project/DressCode/upper_body/dense/'
+        self.data_txt_path = '/home/kwang/DD_project/ControlNet-main/train_clothes_prompt.txt'
+        self.cut_warped_cloth_dir = '/home/kwang/DD_project/C-VTON/arugment_output/cut_clothes/'
+        self.warped_cloth_dir = '/home/kwang/DD_project/C-VTON/arugment_output/warped_clothes/'
+
+        self.arugment_param = 10
+        self.arugment_ratio = 0.5
+
+
+        self.data = []
+        with open(self.data_txt_path, 'rt') as f:
+            for line in f:
+                self.data.append(line.split('\t')[0])
+
+        self.data = self.data[-10:]
+        
+    def name(self):
+        return "DressCodeArugmentDataset"
+    
+    def __getitem__(self, index):
+        img_name = self.data[index]
+
+        img_p = Image.open(self.original_img_dir + img_name).convert("RGB")
+
+        image_tensor = get_tensor(normalize=True, toTensor=True)(img_p)
+
+
+        # 处理去除原有衣服的图片
+        body_parser = cv2.imread(self.body_parser_dir + img_name[:-4] + '.png',0)
+        densepose = cv2.imread(self.densepose_dir + img_name[:-6] + '_5.png', 0)
+        # todo 可以再调整 1,2是躯干
+        person_cloth_body = ((body_parser==4) | (np.isin(densepose, [15,17,16,18,19,21,20,22]))).astype(np.uint8)
+
+        reference_area = (body_parser==4) | (np.isin(densepose, [1,2,15,17,16,18,19,21,20,22]))
+
+        # 用高斯噪声填充原有衣服和人体部分
+        img_array = np.array(img_p)/127.5 - 1
+        person_cloth_body = person_cloth_body[:,:,np.newaxis]
+        person_cloth_body = np.concatenate([person_cloth_body, person_cloth_body, person_cloth_body], axis=2)
+        random_noise = np.random.normal(0, 1, img_array.shape)
+        inpaint_img = img_array * (1 - person_cloth_body) + random_noise * person_cloth_body
+        inpaint_img = get_tensor()(Image.fromarray(((inpaint_img + 1) * 127.5).astype(np.uint8)))
+
+        # 指示合成区域
+        reference_area = 1-get_tensor(normalize=False, toTensor=True)(Image.fromarray(reference_area.astype(np.uint8)*255))
+
+        # 处理clip的指定衣服图片
+        
+        clip_img = Image.open(self.cut_warped_cloth_dir + img_name).convert("RGB")
+        clip_img = get_tensor_encoder()(clip_img)
+        warp_cloth = Image.open(self.warped_cloth_dir + img_name).convert("RGB")
+        warp_cloth = get_tensor()(warp_cloth)
+
+        item = {
+            "GT":image_tensor,
+            "inpaint_image":inpaint_img,
+            "inpaint_mask":reference_area,
+            "ref_imgs":clip_img,
+            "warp_cloth": warp_cloth
+            }
+        return item
+    
+    def __len__(self):
+        return len(self.data)
 
 
 

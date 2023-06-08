@@ -6,7 +6,7 @@ from einops import rearrange, repeat
 from transformers import CLIPTokenizer, CLIPTextModel,CLIPVisionModel,CLIPModel
 import kornia
 from ldm.modules.x_transformer import Encoder, TransformerWrapper  # TODO: can we directly rely on lucidrains code and simply add this as a reuirement? --> test
-from .xf import LayerNorm, Transformer
+from ldm.modules.encoders.xf import LayerNorm, Transformer
 import math
 
 class AbstractEncoder(nn.Module):
@@ -140,14 +140,56 @@ class FrozenCLIPImageEmbedder(AbstractEncoder):
     def __init__(self, version="openai/clip-vit-large-patch14"):
         super().__init__()
         self.transformer = CLIPVisionModel.from_pretrained(version)
+        # 将257 通道的特征图转换为 1 通道的特征图
+        self.conv2 = nn.Conv2d(257, 1, 1)
         self.final_ln = LayerNorm(1024)
         self.mapper = Transformer(
                 1,
                 1024,
-                5,
+                3,
                 1,
             )
+        self.proj_out = nn.Linear(1024, 768)
+        self.freeze()
 
+    def freeze(self):
+        self.transformer = self.transformer.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+        for param in self.mapper.parameters():
+            param.requires_grad = True
+        for param in self.final_ln.parameters():
+            param.requires_grad = True
+
+    def forward(self, image):
+        outputs = self.transformer(pixel_values=image)
+        z = outputs.last_hidden_state
+        b,c,_ = z.shape
+        z = z.view(b,c,32,32)
+        z = self.conv2(z)
+        z = z.view(b, 1, -1)
+        z = self.mapper(z)
+        z = self.final_ln(z)
+        # 把模型中的proj_out挪到这儿来了，因为clip的proj_out是768，把1024映射到768
+        z = self.proj_out(z)
+        return z
+
+    def encode(self, image):
+        return self(image)
+    
+class FrozenCLIPImageEmbedder_ONLY_CLASS(AbstractEncoder):
+    """Uses the CLIP transformer encoder for text (from Hugging Face)"""
+    def __init__(self, version="openai/clip-vit-large-patch14"):
+        super().__init__()
+        self.transformer = CLIPVisionModel.from_pretrained(version)
+        self.final_ln = LayerNorm(1024)
+        self.mapper = Transformer(
+                1,
+                1024,
+                3,
+                1,
+            )
+        self.proj_out = nn.Linear(1024, 768)
         self.freeze()
 
     def freeze(self):
@@ -165,10 +207,58 @@ class FrozenCLIPImageEmbedder(AbstractEncoder):
         z = z.unsqueeze(1)
         z = self.mapper(z)
         z = self.final_ln(z)
+        # 把模型中的proj_out挪到这儿来了，因为clip的proj_out是768，把1024映射到768
+        z = self.proj_out(z)
         return z
 
     def encode(self, image):
         return self(image)
+    
+
+class FrozenClipImageEmbedder_ORG(AbstractEncoder):
+    """
+        Uses the CLIP image encoder.
+        """
+    def __init__(
+            self,
+            model='ViT-L/14',
+            jit=False,
+            device='cpu',
+            antialias=False,
+        ):
+        super().__init__()
+        self.model, _ = clip.load(name=model, device=device, jit=jit)
+
+    def forward(self, x):
+        # output shape [batchsize, 768]
+        return self.model.encode_image(x).unsqueeze(1)
+    
+    def encode(self, image):
+        return self(image)
+    
+
+# 直接返回[batchsize, 257, 1024]
+class FrozenCLIPImageEmbedder_full(AbstractEncoder):
+    """Uses the CLIP transformer encoder for text (from Hugging Face)"""
+    def __init__(self, version="openai/clip-vit-large-patch14"):
+        super().__init__()
+        self.transformer = CLIPVisionModel.from_pretrained(version)
+        self.freeze()
+
+    def freeze(self):
+        self.transformer = self.transformer.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def forward(self, image):
+        outputs = self.transformer(pixel_values=image)
+        z = outputs.last_hidden_state
+        return z
+
+    def encode(self, image):
+        return self(image)
+    
+
 
 
 
@@ -178,5 +268,8 @@ class FrozenCLIPImageEmbedder(AbstractEncoder):
 
 if __name__ == "__main__":
     from ldm.util import count_params
-    model = FrozenCLIPEmbedder()
-    count_params(model, verbose=True)
+    from torchsummary import summary
+    model = FrozenCLIPImageEmbedder()
+    model.cuda()
+    # count_params(model, verbose=True)
+    model(torch.randn(1, 3, 224, 224).cuda())

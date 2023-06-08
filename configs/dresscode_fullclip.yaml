@@ -9,9 +9,9 @@ model:
     timesteps: 1000
     first_stage_key: "inpaint"
     cond_stage_key: "image"
-    image_size: 64
+    image_size: [128, 96]
     channels: 4
-    cond_stage_trainable: true   # Note: different from the one we trained before
+    cond_stage_trainable: False   # Note: different from the one we trained before
     conditioning_key: crossattn
     monitor: val/loss_simple_ema
     u_cond_percent: 0.2
@@ -39,9 +39,10 @@ model:
         channel_mult: [ 1, 2, 4, 4 ]
         num_heads: 8
         use_spatial_transformer: True
-        # 这个可以改一下试试
-        transformer_depth: 1
-        context_dim: 768
+        # 修改了注入的长度和维度
+        transformer_depth: 257
+        context_dim: 1024
+
         use_checkpoint: True
         legacy: False
         add_conv_in_front_of_unet: False
@@ -70,38 +71,28 @@ model:
           target: torch.nn.Identity
 
     cond_stage_config:
-      target: ldm.modules.encoders.modules.FrozenCLIPImageEmbedder
+      # 修改为了原始的clip vision model
+      target: ldm.modules.encoders.modules.FrozenCLIPImageEmbedder_full
 
 data:
   target: main.DataModuleFromConfig
   params:
-      batch_size: 4
+      batch_size: 1
       wrap: False
       train:
-          target: ldm.data.open-images.OpenImageDataset
-          params:
-              state: train
-              dataset_dir: dataset/open-images
-              arbitrary_mask_percent: 0.5
-              image_size: 512
-      validation:
-          target: ldm.data.open-images.OpenImageDataset
-          params:
-              state: validation
-              dataset_dir: dataset/open-images 
-              arbitrary_mask_percent: 0.5
-              image_size: 512
-      test:
-          target: ldm.data.open-images.OpenImageDataset
-          params:
-              state: test
-              dataset_dir: dataset/open-images
-              arbitrary_mask_percent: 0.5
-              image_size: 512
+          # 其余参数均无用
+          target: ldm.data.open-images.DressCodeArugmentDataset
+      # validation:
+      #     target: ldm.data.open-images.DressCodeArugmentDataset
+      # test:
+      #     target: ldm.data.open-images.DressCodeArugmentDataset
+
 
 lightning:
   trainer:
     max_epochs: 40
     num_nodes: 1
+    # precision: 32
     accelerator: 'gpu'
-    gpus: "0,1,2,3,4,5,6,7"
+    gpus: "0,1"
+    strategy: 'deepspeed'

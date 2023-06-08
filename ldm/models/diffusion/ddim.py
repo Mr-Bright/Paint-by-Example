@@ -167,6 +167,9 @@ class DDIMSampler(object):
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None,**kwargs):
         b, *_, device = *x.shape, x.device
+
+        ##########################################################################################
+        # 将inpaint_image和inpaint_mask拼接到x中作为输入, 所以其实inpainting和ddim的mask无关
         if 'test_model_kwargs' in kwargs:
             kwargs=kwargs['test_model_kwargs']
             x = torch.cat([x, kwargs['inpaint_image'], kwargs['inpaint_mask']],dim=1)
@@ -174,6 +177,8 @@ class DDIMSampler(object):
             x = torch.cat((x, kwargs['rest']), dim=1)
         else:
             raise Exception("kwargs must contain either 'test_model_kwargs' or 'rest' key")
+        ###########################################################################################
+
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             e_t = self.model.apply_model(x, t, c)
         else:

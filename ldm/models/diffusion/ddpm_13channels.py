@@ -341,6 +341,7 @@ class DDPM(pl.LightningModule):
             mask = batch['inpaint_mask']
             inpaint = batch['inpaint_image']
             reference = batch['ref_imgs']
+            warp_cloth = batch['warp_cloth']
         else:
             x = batch[k]
         if len(x.shape) == 3:
@@ -349,8 +350,11 @@ class DDPM(pl.LightningModule):
         x = x.to(memory_format=torch.contiguous_format).float()
         mask = mask.to(memory_format=torch.contiguous_format).float()
         inpaint = inpaint.to(memory_format=torch.contiguous_format).float()
-        reference = reference.to(memory_format=torch.contiguous_format).float()
-        return x,inpaint,mask,reference
+        # reference = reference.to(memory_format=torch.contiguous_format).float()
+        # 去掉reference 用0张量替换
+        reference = torch.zeros_like(reference).to(memory_format=torch.contiguous_format).float()
+        warp_cloth = warp_cloth.to(memory_format=torch.contiguous_format).float()
+        return x,inpaint,mask,reference,warp_cloth
 
     def shared_step(self, batch):
         x = self.get_input(batch, self.first_stage_key)
@@ -447,7 +451,7 @@ class LatentDiffusion(DDPM):
                  num_timesteps_cond=None,
                  cond_stage_key="image",
                  cond_stage_trainable=False,
-                 cond_encode_as_input = False,
+                 cloth_encoder_trainable=False,
                  concat_mode=True,
                  cond_stage_forward=None,
                  conditioning_key=None,
@@ -466,22 +470,18 @@ class LatentDiffusion(DDPM):
         ignore_keys = kwargs.pop("ignore_keys", [])
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
         self.learnable_vector = nn.Parameter(torch.randn((1,1,768)), requires_grad=True)
-        self.cond_encode_as_input = cond_encode_as_input
+
+        # 加入了一个cloth encoder
+        self.cloth_encoder = ClothEncoder()
 
         ###############################################################
         # 不是特别清楚这个是啥，，但是是把1024维的向量映射到768维, 每次get_learned_conditioning后必有
         # self.proj_out=nn.Linear(1024, 768)
         ###############################################################
-        # (4,64,64) -> (3,16,16)
-        self.encode_to_condition = nn.Sequential(
-            nn.Conv2d(4,16,4,2,1),
-            nn.GELU(),
-            nn.Conv2d(16,3,4,2,1),
-            nn.Tanh()
-            )
 
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
+        self.cloth_encoder_trainable = cloth_encoder_trainable
         self.cond_stage_key = cond_stage_key
         try:
             self.num_downs = len(first_stage_config.params.ddconfig.ch_mult) - 1
@@ -585,22 +585,16 @@ class LatentDiffusion(DDPM):
 
     # 这个函数调用conditional_stage_model，得到c
     def get_learned_conditioning(self, c):
-        if not self.cond_encode_as_input:
-            if self.cond_stage_forward is None:
-                if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
-                    c = self.cond_stage_model.encode(c)
-                    if isinstance(c, DiagonalGaussianDistribution):
-                        c = c.mode()
-                else:
-                    c = self.cond_stage_model(c)
+        if self.cond_stage_forward is None:
+            if hasattr(self.cond_stage_model, 'encode') and callable(self.cond_stage_model.encode):
+                c = self.cond_stage_model.encode(c)
+                if isinstance(c, DiagonalGaussianDistribution):
+                    c = c.mode()
             else:
-                assert hasattr(self.cond_stage_model, self.cond_stage_forward)
-                c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
+                c = self.cond_stage_model(c)
         else:
-            encoder_posterior_c = self.encode_first_stage(c)
-            c = self.get_first_stage_encoding(encoder_posterior_c).detach()
-            c = self.encode_to_condition(c)
-            c = c.view(c.shape[0], 1, -1)
+            assert hasattr(self.cond_stage_model, self.cond_stage_forward)
+            c = getattr(self.cond_stage_model, self.cond_stage_forward)(c)
         return c
 
 
@@ -695,9 +689,9 @@ class LatentDiffusion(DDPM):
 
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
-                  cond_key=None, return_original_cond=False, bs=None,get_mask=False,get_reference=False):
+                  cond_key=None, return_original_cond=False, bs=None,get_mask=False,get_reference=False,get_warp_cloth=False):
         # x是原图
-        x,inpaint,mask,reference = super().get_input(batch, k)
+        x,inpaint,mask,reference,warp_cloth = super().get_input(batch, k)
         if bs is not None:
             x = x[:bs]
             inpaint = inpaint[:bs]
@@ -711,8 +705,14 @@ class LatentDiffusion(DDPM):
         encoder_posterior_inpaint = self.encode_first_stage(inpaint)
         z_inpaint = self.get_first_stage_encoding(encoder_posterior_inpaint).detach()
         mask_resize = Resize([z.shape[-2],z.shape[-1]])(mask)
+        # 新加入的warp_cloth信息
+        if self.cloth_encoder_trainable:
+            z_cloth = self.cloth_encoder(warp_cloth)
+        else:
+            encoder_posterior_cloth = self.encode_first_stage(warp_cloth)
+            z_cloth = self.get_first_stage_encoding(encoder_posterior_cloth).detach()
 
-        z_new = torch.cat((z,z_inpaint,mask_resize),dim=1)
+        z_new = torch.cat((z,z_inpaint,z_cloth,mask_resize),dim=1)
         #############################################################################
 
         if self.model.conditioning_key is not None:
@@ -766,6 +766,8 @@ class LatentDiffusion(DDPM):
             out.append(mask)
         if get_reference:
             out.append(reference)
+        if get_warp_cloth:
+            out.append(warp_cloth)
         return out
         
     @torch.no_grad()
@@ -1335,18 +1337,20 @@ class LatentDiffusion(DDPM):
 
         log = dict()
 
-        z, c, x, xrec, xc, mask, reference = self.get_input(batch, self.first_stage_key,
+        z, c, x, xrec, xc, mask, reference, warp_cloth = self.get_input(batch, self.first_stage_key,
                                         return_first_stage_outputs=True,
                                         force_c_encode=True,
                                         return_original_cond=True,
                                         get_mask=True,
                                         get_reference=True,
+                                        get_warp_cloth=True,
                                         bs=N)
         N = min(x.shape[0], N)
         n_row = min(x.shape[0], n_row)
         log["inputs"] = x
         log["reconstruction"] = xrec
         log["mask"]=mask
+        log["warp_cloth"]=warp_cloth
         # log["reference"]=reference
         if self.model.conditioning_key is not None:
             if hasattr(self.cond_stage_model, "decode"):
@@ -1459,12 +1463,9 @@ class LatentDiffusion(DDPM):
             # params = params + list(self.cond_stage_model.final_ln.parameters())+list(self.cond_stage_model.mapper.parameters())+list(self.cond_stage_model.proj_out.parameters())
             # 这个是clip_conv的参数
             params = params + list(self.cond_stage_model.final_ln.parameters())+list(self.cond_stage_model.mapper.parameters())+list(self.cond_stage_model.proj_out.parameters())+list(self.cond_stage_model.conv2.parameters())
-
-        # 优化encode_to_condition的参数
-        if self.cond_encode_as_input:
-            print(f"{self.__class__.__name__}: Also optimizing conditioner params!")
-            params = params + list(self.encode_to_condition.parameters())
-        
+        if self.cloth_encoder_trainable:
+            print(f"{self.__class__.__name__}: Also optimizing cloth encoder params!")
+            params = params + list(self.cloth_encoder.parameters())
         if self.learn_logvar:
             print('Diffusion model optimizing logvar')
             params.append(self.logvar)
@@ -1601,5 +1602,19 @@ class LatentInpaintDiffusion(LatentDiffusion):
             return z, all_conds, x, xrec, xc
         return z, all_conds
     
+# (3, 1024, 768) -> (4, 128, 96)
+class ClothEncoder(nn.Module):
+    def __init__(self):
+        super(ClothEncoder, self).__init__()
+        self.cloth_encoder = nn.Sequential(
+            nn.Conv2d(3, 32, 4, 2, 1),
+            nn.GELU(),
+            nn.Conv2d(32, 64, 4, 2, 1),
+            nn.GELU(),
+            nn.Conv2d(64, 4, 4, 2, 1),
+            nn.GELU(),
+        )
+    def forward(self, x):
+        return self.cloth_encoder(x)
     
 

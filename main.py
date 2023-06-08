@@ -74,7 +74,7 @@ def get_parser(**parser_kwargs):
         "--no-test",
         type=str2bool,
         const=True,
-        default=False,
+        default=True,
         nargs="?",
         help="disable test",
     )
@@ -415,7 +415,8 @@ class CUDACallback(Callback):
         torch.cuda.synchronize(trainer.root_gpu)
         self.start_time = time.time()
 
-    def on_train_epoch_end(self, trainer, pl_module, outputs):
+    # 奇怪的pytorch-lightning的bug，删掉了outputs
+    def on_train_epoch_end(self, trainer, pl_module):
         torch.cuda.synchronize(trainer.root_gpu)
         max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
         epoch_time = time.time() - self.start_time
@@ -489,7 +490,7 @@ if __name__ == "__main__":
     # merge trainer cli with config
     trainer_config = lightning_config.get("trainer", OmegaConf.create())
     # default to ddp
-    trainer_config["accelerator"] = "ddp"
+    # trainer_config["accelerator"] = "ddp"
     for k in nondefault_trainer_args(opt):
         trainer_config[k] = getattr(opt, k)
     if not "gpus" in trainer_config:
@@ -551,7 +552,9 @@ if __name__ == "__main__":
         "params": {
             "dirpath": ckptdir,
             "filename": "{epoch:06}",
-            "verbose": True,
+            # 修改了保存checkpoint的频率
+            "every_n_epochs": 10,
+            "verbose": False,
             "save_last": True,
         }
     }
@@ -588,7 +591,9 @@ if __name__ == "__main__":
             "params": {
                 "batch_frequency": 500,
                 "max_images": 4,
-                "clamp": True
+                "clamp": True,
+                # 这个控制log的频率
+                "increase_log_steps": False,
             }
         },
         "learning_rate_logger": {
@@ -702,6 +707,9 @@ if __name__ == "__main__":
     if opt.train:
         try:
             trainer.fit(model, data)
+            # 用了deepspeed就要这么保存
+            print("save final checkpoint", os.path.join(ckptdir, "model_final.ckpt"))
+            torch.save(model.state_dict(), os.path.join(ckptdir, "model_final.ckpt"))
         except Exception:
             melk()
             raise
